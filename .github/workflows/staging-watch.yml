@@ -54,12 +54,13 @@ jobs:
 
       - run: npx playwright install --with-deps chromium
 
+      - name: Create .env
+        run: printf '%s\n' "$ENV_FILE" > .env
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+
       - name: Run tests
         run: npx playwright test
-        env:
-          BASE_URL: ${{ secrets.STAGING_URL }}
-          TEST_USER: ${{ secrets.TEST_USER }}
-          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
 
       - name: Upload report
         if: always()

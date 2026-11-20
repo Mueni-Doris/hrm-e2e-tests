@@ -1,11 +1,13 @@
 name: Test after staging deploy
+
 on:
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch: # lets you run it manually too
+    - cron: '*/30 * * * *'   # check every 30 min
+  workflow_dispatch:          # manual run button
 
 jobs:
   check:
+    name: Check for new staging deploy
     runs-on: ubuntu-latest
     outputs:
       new: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -14,11 +16,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
         run: |
-          q='runs?status=success&per_page=1'
-          BE=$(gh api "repos/Kiotapay-org/hrm-backend/actions/workflows/DEPLOY.yml/$q" --jq '.workflow_runs[0].head_sha')
-          FE=$(gh api "repos/Kiotapay-org/hrm-frontend/actions/workflows/DEPLOY.yml/$q" --jq '.workflow_runs[0].head_sha')
-          echo "key=$BE-$FE" >> $GITHUB_OUTPUT
-          mkdir -p .marker && echo "$BE-$FE" > .marker/sha
+          q='runs?branch=staging&status=success&per_page=1'
+          FE=$(gh api "repos/Kiotapay-org/hr-app-views/actions/workflows/build_and_push.yaml/$q" --jq '.workflow_runs[0].head_sha')
+          BE=$(gh api "repos/Kiotapay-org/hr-app/actions/workflows/build_and_push.yaml/$q" --jq '.workflow_runs[0].head_sha')
+          echo "Frontend on staging: $FE"
+          echo "Backend on staging:  $BE"
+          if [ -z "$FE" ] || [ "$FE" = "null" ] || [ -z "$BE" ] || [ "$BE" = "null" ]; then
+            echo "Could not read deploy SHA. Check token or branch name."; exit 1
+          fi
+          echo "key=$FE-$BE" >> $GITHUB_OUTPUT
+          mkdir -p .marker && echo "$FE-$BE" > .marker/sha
+
       - id: cache
         uses: actions/cache@v4
         with:
@@ -26,20 +34,39 @@ jobs:
           key: tested-${{ steps.deploy.outputs.key }}
 
   test:
+    name: Run HRM Playwright suite
     needs: check
     if: needs.check.outputs.new == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for CapRover to finish deploying
+        run: sleep 180
+
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 20
+          cache: npm
+
       - run: npm ci
+
       - run: npx playwright install --with-deps chromium
-      - run: npx playwright test
+
+      - name: Run tests
+        run: npx playwright test
         env:
           BASE_URL: ${{ secrets.STAGING_URL }}
           TEST_USER: ${{ secrets.TEST_USER }}
           TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
-      - if: always()
+
+      - name: Upload report
+        if: always()
         uses: actions/upload-artifact@v4
-        with: { name: playwright-report, path: playwright-report/ }
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14

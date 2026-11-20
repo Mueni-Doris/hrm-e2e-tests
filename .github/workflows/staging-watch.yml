@@ -3,8 +3,12 @@ name: Test after staging deploy
 on:
   schedule:
     - cron: '*/30 * * * *'   # check every 30 min
-  workflow_dispatch:          # manual run button
-
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run tests even if deploy already tested'
+        type: boolean
+        default: false
 jobs:
   check:
     name: Check for new staging deploy
@@ -36,7 +40,9 @@ jobs:
   test:
     name: Run HRM Playwright suite
     needs: check
-    if: needs.check.outputs.new == 'true'
+    
+    if: needs.check.outputs.new == 'true' || inputs.force
+    
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

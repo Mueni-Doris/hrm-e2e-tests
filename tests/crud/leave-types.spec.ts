@@ -50,7 +50,7 @@ test.describe.serial('Leave types CRUD', () => {
     await confirmAlert(page);
 
     await expect(page.getByText('Leave type deleted successfully!')).toBeVisible();
-    await expect(await findRow(page, renamed)).toHaveCount(0);
+    await expect(await findRow(page, renamed, false)).toHaveCount(0);
   });
 
   test.afterAll(async ({ browser }) => {

@@ -1,7 +1,7 @@
 import { test, expect, type Browser } from '@playwright/test';
 import { hasSession, missing, storageStatePath, type Role } from '../helpers/env';
 import {
-  ROUTES, SUCCESS_APPLY, applyLeaveOnFreeDay, deleteMyLeave, fillLeaveForm, leaveIdFromMyLeaves,
+  ROUTES, SUCCESS_APPLY, applyLeaveOnFreeDay, usableLeaveType, deleteMyLeave, fillLeaveForm, leaveIdFromMyLeaves,
   myLeaveRow, openApplyForm, pastWeekday, randomWeekday, submit,
 } from '../helpers/leave';
 
@@ -104,7 +104,7 @@ test.describe('Leave Management', () => {
     created.push(day);
 
     await openApplyForm(page);
-    await fillLeaveForm(page, { leaveType: LEAVE_TYPE, startDate: day, endDate: day, reason: 'E2E overlap' });
+    await fillLeaveForm(page, { leaveType: usableLeaveType(LEAVE_TYPE), startDate: day, endDate: day, reason: 'E2E overlap' });
     await submit(page);
 
     // Backend: "Leave request conflicts with existing pending leave from X to Y"

@@ -129,32 +129,66 @@ export async function applyLeave(page: Page, input: Required<Pick<LeaveInput, 'l
   await page.waitForURL(/\/manage\/myleaves\/?(\?|$)/);
 }
 
+// Leave types found to have no balance left during this run (shared across tests in the worker).
+const exhausted = new Set<string>();
+let knownTypes: string[] = [];
+
+/** The preferred leave type, or the first other type that still has balance this run. */
+export function usableLeaveType(preferred: string): string {
+  if (!exhausted.has(preferred)) return preferred;
+  const next = knownTypes.find((t) => !exhausted.has(t));
+  if (!next) throw new Error(noBalanceMessage());
+  return next;
+}
+
+function noBalanceMessage() {
+  return `No leave balance left on any leave type for this employee (exhausted: ${[...exhausted].join(', ')}). ` +
+    'Each approve-test run uses up one real leave day: ask HR to top up the test account\'s balance on staging, ' +
+    'or set LEAVE_TYPE in .env to a type that still has days.';
+}
+
+async function readLeaveTypes(page: Page) {
+  if (knownTypes.length) return;
+  await openApplyForm(page);
+  const field = page.locator('div', { has: page.locator('label', { hasText: /^\s*Leave Type/ }) }).last();
+  await field.getByRole('combobox').click();
+  await expect(page.getByRole('option').first()).toBeVisible();
+  knownTypes = (await page.getByRole('option').allInnerTexts()).map((t) => t.trim()).filter(Boolean);
+  await page.keyboard.press('Escape');
+}
+
 /**
  * Applies a one-day leave on a random free weekday and returns the date used.
- * Staging may already hold leaves on some days (from you or earlier runs); on an
- * overlap conflict, try another date instead of failing.
+ * - On an overlap conflict (existing leave that day), tries another date.
+ * - On "Insufficient ... balance", marks that type exhausted and falls back to another
+ *   leave type that still has days (see usableLeaveType()).
  */
-export async function applyLeaveOnFreeDay(page: Page, leaveType: string, attempts = 6): Promise<string> {
+export async function applyLeaveOnFreeDay(page: Page, preferredType: string, attempts = 8): Promise<string> {
+  await readLeaveTypes(page);
   const tried = new Set<string>();
   for (let i = 0; i < attempts; i++) {
+    const leaveType = usableLeaveType(preferredType);
     let day = randomWeekday();
     for (let j = 0; j < 20 && tried.has(day); j++) day = randomWeekday();
     tried.add(day);
 
     await openApplyForm(page);
     await fillLeaveForm(page, { leaveType, startDate: day, endDate: day, reason: `E2E leave test ${Date.now()}` });
+    const insufficient = page.getByText(/Insufficient .*balance/i).first();
+    if (await insufficient.isVisible().catch(() => false)) { exhausted.add(leaveType); continue; }
     await submit(page);
 
     const success = page.getByText(SUCCESS_APPLY);
     const conflict = page.getByText(/conflicts with existing .* leave/i).first();
-    await expect(success.or(conflict).first()).toBeVisible();
+    await expect(success.or(conflict).or(insufficient).first()).toBeVisible();
     if (await success.isVisible()) {
       await page.waitForURL(/\/manage\/myleaves\/?(\?|$)/);
       return day;
     }
+    if (await insufficient.isVisible().catch(() => false)) exhausted.add(leaveType);
   }
-  throw new Error(`Could not find a free day after ${attempts} attempts (tried: ${[...tried].join(', ')}). ` +
-    'Delete old pending E2E leaves on staging.');
+  throw new Error(`Could not apply for leave after ${attempts} attempts (dates tried: ${[...tried].join(', ')}; ` +
+    `exhausted types: ${[...exhausted].join(', ') || 'none'}). Delete old pending E2E leaves or top up balance on staging.`);
 }
 
 // ───────────── my leaves table ─────────────

@@ -40,7 +40,7 @@ test.describe.serial('Shifts CRUD', () => {
     await confirmAlert(page);
 
     await expect(page.getByText('Shift deleted successfully!')).toBeVisible();
-    await expect(await findRow(page, renamed)).toHaveCount(0);
+    await expect(await findRow(page, renamed, false)).toHaveCount(0);
   });
 
   test.afterAll(async ({ browser }) => {

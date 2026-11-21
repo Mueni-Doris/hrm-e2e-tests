@@ -1,5 +1,6 @@
 import { test as base, expect, type Page } from '@playwright/test';
 import { hasSession, storageStatePath } from './env';
+import { logFailureContext, logReason } from './failure-log';
 
 /**
  * Shared fixture for module tests: reuses the employee session (same login as
@@ -17,6 +18,9 @@ export const test = base.extend<{ serverErrors: string[] }>({
       }
     });
     await use(errors);
+    if (errors.length && test.info().status !== test.info().expectedStatus) {
+      logReason(`server errors during test:\n${errors.join('\n')}`);
+    }
   },
   page: async ({ page }, use) => {
     await page.addLocatorHandler(page.getByText('Access Terminated', { exact: true }), async () => {
@@ -25,6 +29,8 @@ export const test = base.extend<{ serverErrors: string[] }>({
         'Sign out of it in your browser while tests run.');
     }, { noWaitAfter: true });
     await use(page);
+    // On failure: log the URL and any error/toast the app was showing.
+    await logFailureContext([page], test.info());
   },
 });
 

@@ -2,14 +2,20 @@ import { test, expect, type Browser } from '@playwright/test';
 import { hasSession, missing, storageStatePath, type Role } from '../helpers/env';
 import {
   ROUTES, SUCCESS_APPLY, applyLeaveOnFreeDay, usableLeaveType, deleteMyLeave, fillLeaveForm, leaveIdFromMyLeaves,
-  myLeaveRow, openApplyForm, pastWeekday, randomWeekday, submit,
+  myLeaveRow, openApplyForm, pastWeekday, randomWeekday, submit, expectFormMessage,
 } from '../helpers/leave';
+import { logFailureContext, logReason } from '../helpers/failure-log';
+import type { Page } from '@playwright/test';
 
 const LEAVE_TYPE = process.env.LEAVE_TYPE ?? '';
+
+// Pages opened by the current test; inspected on failure to log what the app showed.
+let openPages: Page[] = [];
 
 async function pageAs(browser: Browser, role: Role) {
   const ctx = await browser.newContext({ storageState: storageStatePath(role) });
   const page = await ctx.newPage();
+  openPages.push(page);
   // Staging allows one session per account. If the same account signs in elsewhere
   // (e.g. in your own browser), the app shows "Access Terminated" with a countdown.
   // Click "Logout Now" and fail fast with a clear reason instead of timing out.
@@ -32,9 +38,11 @@ test.describe('Leave Management', () => {
     const m = missing('LEAVE_TYPE');
     test.skip(Boolean(m), `Missing in .env: ${m}`);
     created = [];
+    openPages = [];
   });
 
-  test.afterEach(async ({ browser }) => {
+  test.afterEach(async ({ browser }, testInfo) => {
+    await logFailureContext(openPages, testInfo);
     if (!created.length || !hasSession('employee')) return;
     const { ctx, page } = await pageAs(browser, 'employee');
     for (const d of created) await deleteMyLeave(page, d);
@@ -64,7 +72,7 @@ test.describe('Leave Management', () => {
     const appr = await pageAs(browser, 'approver');
     await appr.page.goto(ROUTES.approval(id));
     await appr.page.getByRole('button', { name: 'Approve Leave' }).click();
-    await expect(appr.page.getByText('Leave approved successfully!')).toBeVisible();
+    await expectFormMessage(appr.page, 'Leave approved successfully!', `Approve leave ${day}`);
     await appr.page.waitForURL(/\/manage\/leaves\/pending-approval/);
 
     // Assumes a single approver is configured for the employee's job.
@@ -89,7 +97,7 @@ test.describe('Leave Management', () => {
     await expect(comment).toBeEditable();
     await comment.fill('E2E: rejected by automated test');
     await appr.page.getByRole('button', { name: 'Reject Leave' }).click();
-    await expect(appr.page.getByText('Leave rejected successfully!')).toBeVisible();
+    await expectFormMessage(appr.page, 'Leave rejected successfully!', `Reject leave ${day}`);
 
     await emp.page.goto(ROUTES.myLeaves);
     await expect(myLeaveRow(emp.page, day).first()).toContainText(/rejected/i);
@@ -108,7 +116,7 @@ test.describe('Leave Management', () => {
     await submit(page);
 
     // Backend: "Leave request conflicts with existing pending leave from X to Y"
-    await expect(page.getByText(/conflicts with existing .* leave/i).first()).toBeVisible();
+    await expectFormMessage(page, /conflicts with existing .* leave/i, `Overlap on ${day}`);
     await expect(page.getByText(SUCCESS_APPLY)).toHaveCount(0);
     await expect(page).toHaveURL(/\/myleaves\/create/);
     await ctx.close();
@@ -125,9 +133,12 @@ test.describe('Leave Management', () => {
 
     // Expected behaviour: past-dated leave is refused. Backend only enforces a
     // notice period (skipped when 0) and the calendar window, so this may surface an app bug.
+    if (await page.getByText(SUCCESS_APPLY).isVisible({ timeout: 10_000 }).catch(() => false)) {
+      logReason(`APP BUG? Past-dated leave on ${day} was ACCEPTED`);
+    }
     await expect(page.getByText(SUCCESS_APPLY)).toHaveCount(0, { timeout: 10_000 });
     await expect(page).toHaveURL(/\/myleaves\/create/);
-    await expect(page.getByText(/past|in advance|before today|outside|not allowed|invalid/i).first()).toBeVisible();
+    await expectFormMessage(page, /past|in advance|before today|outside|not allowed|invalid/i, `Past date ${day}`);
     await ctx.close();
   });
 
@@ -137,9 +148,9 @@ test.describe('Leave Management', () => {
     await submit(page);
 
     // Messages appear both inline and in a toast — assert the first match.
-    await expect(page.getByText('Leave type is required').first()).toBeVisible();
-    await expect(page.getByText('Start date is required').first()).toBeVisible();
-    await expect(page.getByText('End date is required').first()).toBeVisible();
+    await expectFormMessage(page, 'Leave type is required', 'Missing leave type');
+    await expectFormMessage(page, 'Start date is required', 'Missing start date');
+    await expectFormMessage(page, 'End date is required', 'Missing end date');
     await expect(page).toHaveURL(/\/myleaves\/create/);
     await ctx.close();
   });
@@ -153,7 +164,7 @@ test.describe('Leave Management', () => {
     await fillLeaveForm(page, { leaveType: LEAVE_TYPE, startDate: start, endDate: end, reason: 'E2E reversed dates' });
     await submit(page);
 
-    await expect(page.getByText('End date must be after or equal to start date').first()).toBeVisible();
+    await expectFormMessage(page, 'End date must be after or equal to start date', `End ${end} before start ${start}`);
     await expect(page.getByText(SUCCESS_APPLY)).toHaveCount(0);
     await ctx.close();
   });

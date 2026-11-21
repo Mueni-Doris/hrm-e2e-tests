@@ -1,4 +1,5 @@
-import { expect, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
+import { classify, logReason, pageFeedback, type Outcome } from './failure-log';
 
 export const ROUTES = {
   myLeaves: '/manage/myleaves',
@@ -98,7 +99,7 @@ export async function fillLeaveForm(page: Page, input: LeaveInput) {
     if (!(await option.isVisible({ timeout: 10_000 }).catch(() => false))) {
       const available = (await page.getByRole('option').allInnerTexts()).map((s) => s.trim()).filter(Boolean);
       throw new Error(`Leave type "${input.leaveType}" is not available to this employee. ` +
-        `Available: ${available.join(', ') || '(none)'}. Update LEAVE_TYPE / ZERO_BALANCE_LEAVE_TYPE in .env.`);
+        `Available: ${available.join(', ') || '(none)'}. Update LEAVE_TYPE in .env.`);
     }
     await option.click();
   }
@@ -157,38 +158,101 @@ async function readLeaveTypes(page: Page) {
   await page.keyboard.press('Escape');
 }
 
+export interface Attempt { n: number; date: string; leaveType: string; outcome: Outcome; message: string }
+
+function describeAttempts(attempts: Attempt[]) {
+  return attempts.map((a) => `  #${a.n} ${a.date} [${a.leaveType}] → ${a.outcome.toUpperCase()}: ${a.message}`).join('\n');
+}
+
+/** Headline for the error, naming the dominant reason (conflict vs balance vs other). */
+function headline(attempts: Attempt[]) {
+  const count = (o: Outcome) => attempts.filter((a) => a.outcome === o).length;
+  const c = count('conflict'), b = count('balance'), v = count('validation'), n = count('no-message');
+  const parts = [c && `${c} date conflict(s)`, b && `${b} no-balance`, v && `${v} validation error(s)`, n && `${n} with no message`]
+    .filter(Boolean).join(', ');
+  let why: string;
+  if (c === attempts.length) why = 'CONFLICT: every date tried already has a leave. Delete old pending E2E leaves on staging (My Leaves).';
+  else if (b && !knownTypes.some((t) => !exhausted.has(t))) why = 'BALANCE: ' + noBalanceMessage();
+  else if (c && c >= b) why = 'Mostly CONFLICT: dates already taken by existing leaves.';
+  else if (b) why = 'Mostly BALANCE: leave types are out of days.';
+  else if (v) why = 'VALIDATION: the app rejected the form — see the messages per attempt below.';
+  else why = 'NO MESSAGE: the app neither confirmed nor showed an error — check the trace/screenshot.';
+  return `Could not apply for leave after ${attempts.length} attempts (${parts}).\n${why}`;
+}
+
 /**
  * Applies a one-day leave on a random free weekday and returns the date used.
- * - On an overlap conflict (existing leave that day), tries another date.
- * - On "Insufficient ... balance", marks that type exhausted and falls back to another
- *   leave type that still has days (see usableLeaveType()).
+ * Every attempt is recorded with its outcome and the exact app message:
+ * - conflict (existing leave that day)  → try another date
+ * - balance ("Insufficient ... balance") → mark the type exhausted, fall back to another type
+ * - validation / no-message             → retry; reported if all attempts fail
+ * Attempts are logged (console + test-results/failure-reasons.log + HTML report attachment).
  */
-export async function applyLeaveOnFreeDay(page: Page, preferredType: string, attempts = 8): Promise<string> {
+export async function applyLeaveOnFreeDay(page: Page, preferredType: string, maxAttempts = 8): Promise<string> {
   await readLeaveTypes(page);
   const tried = new Set<string>();
-  for (let i = 0; i < attempts; i++) {
-    const leaveType = usableLeaveType(preferredType);
-    let day = randomWeekday();
-    for (let j = 0; j < 20 && tried.has(day); j++) day = randomWeekday();
-    tried.add(day);
+  const attempts: Attempt[] = [];
+  const record = async (a: Attempt) => {
+    attempts.push(a);
+    logReason(`leave attempt #${a.n} ${a.date} [${a.leaveType}] → ${a.outcome.toUpperCase()}${a.message ? `: ${a.message}` : ''}`);
+  };
 
-    await openApplyForm(page);
-    await fillLeaveForm(page, { leaveType, startDate: day, endDate: day, reason: `E2E leave test ${Date.now()}` });
-    const insufficient = page.getByText(/Insufficient .*balance/i).first();
-    if (await insufficient.isVisible().catch(() => false)) { exhausted.add(leaveType); continue; }
-    await submit(page);
+  try {
+    for (let i = 1; i <= maxAttempts; i++) {
+      let leaveType: string;
+      try { leaveType = usableLeaveType(preferredType); } catch { break; } // every type exhausted
+      let day = randomWeekday();
+      for (let j = 0; j < 20 && tried.has(day); j++) day = randomWeekday();
+      tried.add(day);
 
-    const success = page.getByText(SUCCESS_APPLY);
-    const conflict = page.getByText(/conflicts with existing .* leave/i).first();
-    await expect(success.or(conflict).or(insufficient).first()).toBeVisible();
-    if (await success.isVisible()) {
-      await page.waitForURL(/\/manage\/myleaves\/?(\?|$)/);
-      return day;
+      await openApplyForm(page);
+      await fillLeaveForm(page, { leaveType, startDate: day, endDate: day, reason: `E2E leave test ${Date.now()}` });
+
+      // The form validates live (balance/conflict) before submit.
+      let msgs = await pageFeedback(page);
+      let outcome = classify(msgs);
+      if (outcome !== 'conflict' && outcome !== 'balance') {
+        await submit(page);
+        const success = page.getByText(SUCCESS_APPLY);
+        const anyFeedback = page.getByText(/conflicts with existing|insufficient .*balance|required|must|invalid|error|failed/i).first();
+        await expect(success.or(anyFeedback).first()).toBeVisible().catch(() => {});
+        if (await success.isVisible().catch(() => false)) {
+          await page.waitForURL(/\/manage\/myleaves\/?(\?|$)/);
+          await record({ n: i, date: day, leaveType, outcome: 'success', message: SUCCESS_APPLY });
+          return day;
+        }
+        msgs = await pageFeedback(page);
+        outcome = classify(msgs);
+      }
+      const relevant = msgs.filter((m) => !/Approval Flow/i.test(m));
+      await record({ n: i, date: day, leaveType, outcome, message: relevant.join(' | ') || '(app showed no message)' });
+      if (outcome === 'balance') exhausted.add(leaveType);
     }
-    if (await insufficient.isVisible().catch(() => false)) exhausted.add(leaveType);
+  } finally {
+    if (attempts.length) {
+      await test.info().attach('leave-attempts', { body: describeAttempts(attempts), contentType: 'text/plain' }).catch(() => {});
+    }
   }
-  throw new Error(`Could not apply for leave after ${attempts} attempts (dates tried: ${[...tried].join(', ')}; ` +
-    `exhausted types: ${[...exhausted].join(', ') || 'none'}). Delete old pending E2E leaves or top up balance on staging.`);
+  throw new Error(`${headline(attempts)}\nAttempts:\n${describeAttempts(attempts) || '  (none — no usable leave type)'}`);
+}
+
+/**
+ * Asserts the form shows `expected`; if not, the error says what the app showed instead
+ * (e.g. a balance error where a conflict was expected).
+ */
+export async function expectFormMessage(page: Page, expected: RegExp | string, what: string) {
+  const loc = typeof expected === 'string' ? page.getByText(expected).first() : page.getByText(expected).first();
+  try {
+    await expect(loc).toBeVisible();
+    logReason(`${what}: app showed the expected message (${expected})`);
+  } catch {
+    const msgs = await pageFeedback(page);
+    const shown = msgs.join(' | ') || '(no visible message)';
+    const reason = classify(msgs);
+    logReason(`${what}: expected ${expected} but app showed [${reason.toUpperCase()}] ${shown}`);
+    throw new Error(`${what}: expected message ${expected} was not shown.\n` +
+      `App showed instead (${reason.toUpperCase()}): ${shown}\nURL: ${page.url()}`);
+  }
 }
 
 // ───────────── my leaves table ─────────────

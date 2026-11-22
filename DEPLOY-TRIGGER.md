@@ -63,6 +63,10 @@ The workflow also:
 
 ## Notes that explain past CI failures
 
+- **Leave tests fail with "Could not apply for leave after 8 attempts (8 date conflicts)"**: test leaves
+  left behind by cancelled/timed-out runs (every 30 min) filled every free weekday in the date window.
+  The helper now deletes a conflicting PENDING leave when its reason contains "E2E" (real leaves are never
+  touched), and waits for slow submits instead of retrying while the first request is still processing.
 - **Leave tests fail with "Insufficient accrued leave balance"**: the limit is days *earned to date*
   (accrual), not the yearly allocation, so raising the allocation doesn't help straight away. The approve
   test also uses up one real day per run. Fixes: HR tops up / resets the test account's accrued balance, or

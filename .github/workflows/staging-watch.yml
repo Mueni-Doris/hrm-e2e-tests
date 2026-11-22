@@ -1,17 +1,28 @@
 name: Test after staging deploy
 
 on:
+  # Preferred: the app repos' deploy workflows send this event when a staging deploy finishes
+  # (see DEPLOY-TRIGGER.md). Runs straight away, no polling.
+  repository_dispatch:
+    types: [staging-deployed]
+  # Fallback poll: only runs tests when the deployed SHA changed. Remove once the dispatch is set up.
   schedule:
-    - cron: '*/30 * * * *'   # check every 30 min
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       force:
         description: 'Run tests even if deploy already tested'
         type: boolean
         default: false
+# Staging allows one session per account: never run two suites at once with the same account.
+concurrency:
+  group: staging-test-account
+  cancel-in-progress: false
+
 jobs:
   check:
     name: Check for new staging deploy
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     outputs:
       new: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -40,7 +51,11 @@ jobs:
   test:
     name: Run HRM Playwright suite
     needs: check
-    if: needs.check.outputs.new == 'true' || inputs.force
+    # Dispatch / manual runs skip the SHA check; scheduled runs need a new deploy.
+    if: >-
+      always() &&
+      (github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch' ||
+       needs.check.outputs.new == 'true')
     runs-on: ubuntu-24.04
     container:
       image: mcr.microsoft.com/playwright:v1.56.1-noble
@@ -48,8 +63,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Wait for CapRover to finish deploying
-        run: sleep 180
+      - name: Wait until staging serves the app
+        # Replaces a fixed sleep: poll until the frontend answers quickly (deploy finished + warm).
+        run: |
+          URL="https://hr-app-frontend-staging.staging.kiotapay.com/login"
+          for i in $(seq 1 40); do
+            t=$(curl -s -o /dev/null -m 20 -w '%{http_code} %{time_total}' "$URL" || echo "000 99")
+            code=${t%% *}; secs=${t##* }
+            echo "attempt $i: HTTP $code in ${secs}s"
+            if [ "$code" -lt 500 ] && [ "$code" != "000" ] && awk "BEGIN{exit !($secs < 10)}"; then exit 0; fi
+            sleep 15
+          done
+          echo "Staging not ready after 10 minutes"; exit 1
 
       - run: npm ci
 

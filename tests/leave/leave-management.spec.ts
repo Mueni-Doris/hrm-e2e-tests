@@ -62,7 +62,9 @@ test.describe('Leave Management', () => {
     await ctx.close();
   });
 
-  test('approver can approve a pending leave', async ({ browser }) => {
+  // Approving uses up one real leave day (approved leaves can't be cancelled from the UI).
+  // Frequent CI runs can skip it with: --grep-invert @consumes-balance
+  test('approver can approve a pending leave', { tag: '@consumes-balance' }, async ({ browser }) => {
     test.skip(!hasSession('approver'), 'No approver session — set APPROVER_USERNAME/PASSWORD in .env');
     const emp = await pageAs(browser, 'employee');
     const day = await applyLeaveOnFreeDay(emp.page, LEAVE_TYPE);

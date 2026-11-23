@@ -29,6 +29,8 @@ async function pageAs(browser: Browser, role: Role) {
 }
 
 test.describe('Leave Management', () => {
+  // Slow staging plus cleanup of leftover test leaves on conflicting dates needs more than the default 90s.
+  test.describe.configure({ timeout: 300_000 });
 
   // Dates created by a test; cleaned up (deleted while PENDING) afterwards.
   let created: string[] = [];
@@ -62,7 +64,9 @@ test.describe('Leave Management', () => {
     await ctx.close();
   });
 
-  test('approver can approve a pending leave', async ({ browser }) => {
+  // Approving uses up one real leave day (approved leaves can't be cancelled from the UI).
+  // Frequent CI runs can skip it with: --grep-invert @consumes-balance
+  test('approver can approve a pending leave', { tag: '@consumes-balance' }, async ({ browser }) => {
     test.skip(!hasSession('approver'), 'No approver session — set APPROVER_USERNAME/PASSWORD in .env');
     const emp = await pageAs(browser, 'employee');
     const day = await applyLeaveOnFreeDay(emp.page, LEAVE_TYPE);
@@ -76,7 +80,7 @@ test.describe('Leave Management', () => {
     await appr.page.waitForURL(/\/manage\/leaves\/pending-approval/);
 
     // Assumes a single approver is configured for the employee's job.
-    await emp.page.goto(ROUTES.myLeaves);
+    await emp.page.goto(ROUTES.myLeavesAll);
     await expect(myLeaveRow(emp.page, day).first()).toContainText(/approved/i);
     await Promise.all([emp.ctx.close(), appr.ctx.close()]);
   });
@@ -99,7 +103,7 @@ test.describe('Leave Management', () => {
     await appr.page.getByRole('button', { name: 'Reject Leave' }).click();
     await expectFormMessage(appr.page, 'Leave rejected successfully!', `Reject leave ${day}`);
 
-    await emp.page.goto(ROUTES.myLeaves);
+    await emp.page.goto(ROUTES.myLeavesAll);
     await expect(myLeaveRow(emp.page, day).first()).toContainText(/rejected/i);
     await Promise.all([emp.ctx.close(), appr.ctx.close()]);
   });
@@ -133,8 +137,9 @@ test.describe('Leave Management', () => {
 
     // Expected behaviour: past-dated leave is refused. Backend only enforces a
     // notice period (skipped when 0) and the calendar window, so this may surface an app bug.
-    if (await page.getByText(SUCCESS_APPLY).isVisible({ timeout: 10_000 }).catch(() => false)) {
+    if (await expect(page.getByText(SUCCESS_APPLY)).toBeVisible({ timeout: 10_000 }).then(() => true, () => false)) {
       logReason(`APP BUG? Past-dated leave on ${day} was ACCEPTED`);
+      throw new Error(`APP BUG: a leave dated in the past (${day}) was accepted ("${SUCCESS_APPLY}"). It is deleted again in cleanup.`);
     }
     await expect(page.getByText(SUCCESS_APPLY)).toHaveCount(0, { timeout: 10_000 });
     await expect(page).toHaveURL(/\/myleaves\/create/);

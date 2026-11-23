@@ -3,6 +3,8 @@ import { classify, logReason, pageFeedback, type Outcome } from './failure-log';
 
 export const ROUTES = {
   myLeaves: '/manage/myleaves',
+  /** All leaves on one page (the table pages 10 at a time; older test leaves end up on page 2+). */
+  myLeavesAll: '/manage/myleaves?size=500',
   applyLeave: '/manage/myleaves/create',
   pendingApproval: '/manage/leaves/pending-approval',
   approval: (id: string) => `/manage/leaves/${id}/approval`,
@@ -96,7 +98,7 @@ export async function fillLeaveForm(page: Page, input: LeaveInput) {
     const field = page.locator('div', { has: page.locator('label', { hasText: /^\s*Leave Type/ }) }).last();
     await field.getByRole('combobox').click();
     const option = page.getByRole('option', { name: input.leaveType, exact: false }).first();
-    if (!(await option.isVisible({ timeout: 10_000 }).catch(() => false))) {
+    if (!(await expect(option).toBeVisible({ timeout: 15_000 }).then(() => true, () => false))) {
       const available = (await page.getByRole('option').allInnerTexts()).map((s) => s.trim()).filter(Boolean);
       throw new Error(`Leave type "${input.leaveType}" is not available to this employee. ` +
         `Available: ${available.join(', ') || '(none)'}. Update LEAVE_TYPE in .env.`);
@@ -197,6 +199,8 @@ export async function applyLeaveOnFreeDay(page: Page, preferredType: string, max
     logReason(`leave attempt #${a.n} ${a.date} [${a.leaveType}] → ${a.outcome.toUpperCase()}${a.message ? `: ${a.message}` : ''}`);
   };
 
+  let cleanups = 0;
+  const MAX_CLEANUPS = 10;
   try {
     for (let i = 1; i <= maxAttempts; i++) {
       let leaveType: string;
@@ -214,9 +218,19 @@ export async function applyLeaveOnFreeDay(page: Page, preferredType: string, max
       if (outcome !== 'conflict' && outcome !== 'balance') {
         await submit(page);
         const success = page.getByText(SUCCESS_APPLY);
-        const anyFeedback = page.getByText(/conflicts with existing|insufficient .*balance|required|must|invalid|error|failed/i).first();
-        await expect(success.or(anyFeedback).first()).toBeVisible().catch(() => {});
-        if (await success.isVisible().catch(() => false)) {
+        const listUrl = /\/manage\/myleaves\/?(\?|$)/;
+        // Staging can take 30s+ to answer: wait until the request finishes (button leaves
+        // "Validating/Processing", the success toast shows, or we land on My Leaves) before judging.
+        const settled = await expect.poll(async () =>
+            listUrl.test(page.url())
+            || (await success.isVisible().catch(() => false))
+            || !/Validating|Processing|Loading/i.test(await submitButton(page).innerText().catch(() => '')),
+          { timeout: 60_000, intervals: [500, 1000, 2000] }).toBe(true).then(() => true, () => false);
+        if (!settled) {
+          await record({ n: i, date: day, leaveType, outcome: 'no-message', message: 'submit still "Processing" after 60s (staging did not answer)' });
+          continue;
+        }
+        if (listUrl.test(page.url()) || (await success.isVisible().catch(() => false))) {
           await page.waitForURL(/\/manage\/myleaves\/?(\?|$)/);
           await record({ n: i, date: day, leaveType, outcome: 'success', message: SUCCESS_APPLY });
           return day;
@@ -227,6 +241,10 @@ export async function applyLeaveOnFreeDay(page: Page, preferredType: string, max
       const relevant = msgs.filter((m) => !/Approval Flow/i.test(m));
       await record({ n: i, date: day, leaveType, outcome, message: relevant.join(' | ') || '(app showed no message)' });
       if (outcome === 'balance') exhausted.add(leaveType);
+      if (outcome === 'conflict' && cleanups < MAX_CLEANUPS) {
+        cleanups++;
+        if (await deleteLeftoverE2ELeave(page, day)) tried.delete(day); // the date is free again
+      }
     }
   } finally {
     if (attempts.length) {
@@ -257,14 +275,16 @@ export async function expectFormMessage(page: Page, expected: RegExp | string, w
 
 // ───────────── my leaves table ─────────────
 
-export function myLeaveRow(page: Page, startDate: string): Locator {
-  return page.getByRole('row').filter({ hasText: displayDate(startDate) });
+export function myLeaveRow(page: Page, startDate: string, status?: 'PENDING'): Locator {
+  const rows = page.getByRole('row').filter({ hasText: displayDate(startDate) });
+  // A date can also have REJECTED rows from earlier runs; cleanup must target the PENDING one.
+  return status ? rows.filter({ hasText: status }) : rows;
 }
 
 /** Opens the row's action menu and returns the leave UUID from the "View Details" link. */
-export async function leaveIdFromMyLeaves(page: Page, startDate: string): Promise<string> {
-  await page.goto(ROUTES.myLeaves);
-  const row = myLeaveRow(page, startDate).first();
+export async function leaveIdFromMyLeaves(page: Page, startDate: string, status?: 'PENDING'): Promise<string> {
+  await page.goto(ROUTES.myLeavesAll);
+  const row = myLeaveRow(page, startDate, status).first();
   await expect(row).toBeVisible();
   await row.getByRole('button', { name: 'Open menu' }).click();
   // DropdownMenuItem asChild + <Link> → the menuitem element is the <a> itself.
@@ -275,12 +295,45 @@ export async function leaveIdFromMyLeaves(page: Page, startDate: string): Promis
   return id;
 }
 
+/**
+ * Deletes the PENDING leave on `startDate` only if a test created it (its reason contains "E2E").
+ * Leftovers come from runs that were cancelled or whose submit answered after the test moved on;
+ * without this they block every date in the window ("conflicts with existing pending leave").
+ * Real leaves (no "E2E" in the reason) are never touched. Returns true when one was deleted.
+ */
+export async function deleteLeftoverE2ELeave(page: Page, startDate: string): Promise<boolean> {
+  try {
+    const id = await leaveIdFromMyLeaves(page, startDate, 'PENDING');
+    await page.goto(`${ROUTES.myLeaves}/${id}`);
+    // The details page loads the form, then fills the reason editor; give slow staging time.
+    const isE2E = await expect(page.getByText(/\bE2E\b/).first()).toBeVisible({ timeout: 20_000 }).then(() => true, () => false);
+    if (!isE2E) {
+      logReason(`pending leave on ${startDate} is not a test leave (no "E2E" in reason): left alone`);
+      return false;
+    }
+    await page.goto(ROUTES.myLeavesAll);
+    const pendingRows = myLeaveRow(page, startDate, 'PENDING');
+    await expect(pendingRows.first()).toBeVisible({ timeout: 30_000 });
+    const before = await pendingRows.count();
+    await deleteMyLeave(page, startDate);
+    await page.goto(ROUTES.myLeavesAll);
+    await expect(page.getByRole('row').nth(1)).toBeVisible({ timeout: 30_000 });
+    const after = await pendingRows.count();
+    logReason(`deleted leftover E2E pending leave on ${startDate} (pending rows ${before} → ${after})`);
+    return after === 0;
+  } catch (e) {
+    logReason(`could not clean up leftover leave on ${startDate}: ${(e as Error).message.split('\n')[0]}`);
+    return false;
+  }
+}
+
 /** Best-effort cleanup: delete a PENDING leave from My Leaves. Never throws. */
 export async function deleteMyLeave(page: Page, startDate: string) {
   try {
-    await page.goto(ROUTES.myLeaves);
-    const row = myLeaveRow(page, startDate).first();
-    if (!(await row.isVisible({ timeout: 10_000 }).catch(() => false))) return;
+    await page.goto(ROUTES.myLeavesAll);
+    const row = myLeaveRow(page, startDate, 'PENDING').first();
+    // isVisible() does not wait; staging can take 20s+ to list leaves.
+    if (!(await expect(row).toBeVisible({ timeout: 30_000 }).then(() => true, () => false))) return;
     await row.getByRole('button', { name: 'Open menu' }).click();
     const del = page.getByRole('menuitem', { name: /Delete Leave/ });
     if (!(await del.isVisible().catch(() => false))) { await page.keyboard.press('Escape'); return; }
